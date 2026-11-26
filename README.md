@@ -23,7 +23,7 @@ test traffic it measures with.
    ```
 3. Start it:
    ```
-   python collector.py --location library-4f --device kirby-laptop --db wifi_data.db
+   python collector.py --location library-4f --device laptop-name --db wifi_data.db
    ```
 4. Leave the window open. Every 5 seconds it prints one line, for example:
    ```
