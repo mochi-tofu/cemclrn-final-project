@@ -8,7 +8,9 @@ Three loops run side by side:
   - Reading loop  (default every 5 s):  signal info + N TCP "pings"
   - Transfer loop (default every 60 s): timed download (the label, plus time to
                                         first byte), then a timed upload
-  - Scan loop     (default every 60 s): list of nearby access points
+  - Scan loop     (default every 60 s): asks the OS for a fresh Wi-Fi scan, then
+                                        lists nearby access points and counts the
+                                        ones on the same and overlapping channels
 
 Only the Python standard library is required on Windows and Linux.
 On macOS, install `pyobjc-framework-CoreWLAN` for fast signal readings and for
@@ -46,30 +48,30 @@ TRANSFER_TIMEOUT_S = 20
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
     id            TEXT PRIMARY KEY,
-    ts            TEXT NOT NULL,      -- ISO 8601 with timezone; timestamp
-    session_id    TEXT NOT NULL,      -- session each time u run
-    device_id     TEXT NOT NULL,      -- laptop name u type
-    os            TEXT NOT NULL,      -- OS system (windows, Mac, Linux reports signal diff)
-    location      TEXT NOT NULL,      -- location name u typed
-    ssid          TEXT,               -- network name (i.e. DLSU-Wifi)
-    bssid         TEXT,               -- access point's hardware address (one network has many access points around campus)
-    signal_pct    REAL,               -- Windows / Linux report percent; signal strength in percent; NULL in MAC
+    ts            TEXT NOT NULL,      -- ISO 8601 with timezone
+    session_id    TEXT NOT NULL,
+    device_id     TEXT NOT NULL,
+    os            TEXT NOT NULL,
+    location      TEXT NOT NULL,
+    ssid          TEXT,
+    bssid         TEXT,
+    signal_pct    REAL,               -- Windows / Linux report percent
     rssi_dbm      REAL,               -- macOS reports dBm
-    noise_dbm     REAL,               -- bg radio noise (only in MAC); lower or more nega better, shows how clearly signal stands out
-    channel       TEXT,               -- 1-13 are 2.4 GHz; 36 and above are 5 GHz
-    band          TEXT,               -- 2.4 GHz reaches farther but slower and more crowded; 5 GHz is faster but hsorter range
-    radio_type    TEXT,               -- wifi standard/gen (802.11n = Wi-Fi 4, ac = Wi-Fi 5, ax = Wi-Fi 6)
-    rx_rate_mbps  REAL,               -- receive link speed; max rate laptop and access point agreed on for receiving; not actual internet speed (windows, Linux)
-    tx_rate_mbps  REAL,               -- similar but for sending (windows, mac)
-    uploaded      INTEGER DEFAULT 0   -- if uploaded to central database (Supabase)
+    noise_dbm     REAL,
+    channel       TEXT,
+    band          TEXT,
+    radio_type    TEXT,
+    rx_rate_mbps  REAL,
+    tx_rate_mbps  REAL,
+    uploaded      INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS pings (
     id            TEXT PRIMARY KEY,
     reading_id    TEXT NOT NULL REFERENCES readings(id),
-    ts            TEXT NOT NULL,      -- timsetamp for ping
-    seq           INTEGER NOT NULL,   -- each reading has 5 pings, this says which ping it is
+    ts            TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
     latency_ms    REAL,               -- NULL = lost / timed out
-    error         TEXT,               -- why ping failed
+    error         TEXT,
     uploaded      INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS downloads (
@@ -79,13 +81,13 @@ CREATE TABLE IF NOT EXISTS downloads (
     device_id     TEXT NOT NULL,
     os            TEXT NOT NULL,
     location      TEXT NOT NULL,
-    bytes         INTEGER,            -- how much bytes downloaded, should be 1000000, cuz set to donwload 1MB
-    duration_s    REAL,               -- NULL = failed; download time in seconds
-    error         TEXT,               -- why download failed, should be 500000
+    bytes         INTEGER,
+    duration_s    REAL,               -- NULL = failed
+    error         TEXT,
     ttfb_s        REAL,               -- time to first byte of the download
-    upload_bytes  INTEGER,            -- bytes uploaded
-    upload_s      REAL,               -- NULL = failed; upload time in seconds
-    upload_error  TEXT,               -- why upload failed
+    upload_bytes  INTEGER,
+    upload_s      REAL,               -- NULL = failed
+    upload_error  TEXT,
     uploaded      INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS scans (
@@ -95,23 +97,25 @@ CREATE TABLE IF NOT EXISTS scans (
     device_id          TEXT NOT NULL,
     os                 TEXT NOT NULL,
     location           TEXT NOT NULL,
-    connected_bssid    TEXT,          -- access point you were on during the scan
-    connected_channel  TEXT,          -- channel during scan
-    ap_count           INTEGER,       -- all access points seen from any network
-    same_channel_count INTEGER,       -- other acces points on your channel (excluding yours)
+    connected_bssid    TEXT,
+    connected_channel  TEXT,
+    ap_count           INTEGER,       -- all access points seen
+    same_channel_count INTEGER,       -- others on your channel (excluding yours)
+    overlap_channel_count INTEGER,    -- others on a partly overlapping channel (2.4 GHz)
+    rescanned          INTEGER,       -- 1 = a fresh scan was requested first
     error              TEXT,
     uploaded           INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS scan_aps (
     id            TEXT PRIMARY KEY,
-    scan_id       TEXT NOT NULL REFERENCES scans(id),  --which scan this came from
-    ssid          TEXT,               -- network name
-    bssid         TEXT,               -- access point address
-    signal_pct    REAL,               -- its signal (windows, linux)
-    rssi_dbm      REAL,               -- its signal (mac)
-    channel       TEXT,               -- its channel
-    band          TEXT,               -- its band
-    is_connected  INTEGER,            -- the access point ur connected to =1, if others =0
+    scan_id       TEXT NOT NULL REFERENCES scans(id),
+    ssid          TEXT,
+    bssid         TEXT,
+    signal_pct    REAL,
+    rssi_dbm      REAL,
+    channel       TEXT,
+    band          TEXT,
+    is_connected  INTEGER,
     uploaded      INTEGER DEFAULT 0
 );
 """
@@ -120,7 +124,10 @@ CREATE TABLE IF NOT EXISTS scan_aps (
 NEW_COLUMNS = {
     "downloads": {"ttfb_s": "REAL", "upload_bytes": "INTEGER",
                   "upload_s": "REAL", "upload_error": "TEXT"},
+    "scans": {"overlap_channel_count": "INTEGER", "rescanned": "INTEGER"},
 }
+
+RESCAN_WAIT_S = 4.0   # Windows drivers must finish a scan within 4 seconds
 
 
 def now_iso():
@@ -307,12 +314,74 @@ def parse_nmcli_list(text):
     return aps
 
 
+def request_rescan_windows():
+    """Ask Windows for a fresh Wi-Fi scan through the Native Wifi API (wlanapi.dll).
+
+    `netsh` has no scan command, and without this the access point list can stay
+    unchanged for many minutes. Returns True if the request was accepted.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    class WLAN_INTERFACE_INFO(ctypes.Structure):
+        _fields_ = [("InterfaceGuid", GUID),
+                    ("strInterfaceDescription", ctypes.c_wchar * 256),
+                    ("isState", ctypes.c_uint)]
+
+    class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+        _fields_ = [("dwNumberOfItems", wintypes.DWORD), ("dwIndex", wintypes.DWORD),
+                    ("InterfaceInfo", WLAN_INTERFACE_INFO * 1)]
+
+    wlan = ctypes.windll.wlanapi
+    handle, version = wintypes.HANDLE(), wintypes.DWORD()
+    if wlan.WlanOpenHandle(2, None, ctypes.byref(version), ctypes.byref(handle)) != 0:
+        return False
+    ok = False
+    try:
+        lst = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
+        if wlan.WlanEnumInterfaces(handle, None, ctypes.byref(lst)) != 0:
+            return False
+        try:
+            first = ctypes.addressof(lst.contents.InterfaceInfo)
+            items = ctypes.cast(first, ctypes.POINTER(WLAN_INTERFACE_INFO))
+            for i in range(lst.contents.dwNumberOfItems):
+                guid = items[i].InterfaceGuid
+                if wlan.WlanScan(handle, ctypes.byref(guid), None, None, None) == 0:
+                    ok = True
+        finally:
+            wlan.WlanFreeMemory(lst)
+    finally:
+        wlan.WlanCloseHandle(handle, None)
+    return ok
+
+
+def request_rescan():
+    """Ask the OS for a fresh scan, then wait for it to finish. Returns True/False."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            ok = request_rescan_windows()
+        elif system == "Linux":
+            ok = subprocess.run(["nmcli", "dev", "wifi", "rescan"], capture_output=True,
+                                timeout=10).returncode == 0
+        else:
+            return False  # macOS: the CoreWLAN scan below is already a fresh scan
+        if ok:
+            time.sleep(RESCAN_WAIT_S)
+        return ok
+    except Exception:
+        return False
+
+
 def scan_aps():
     """Returns (list of access points, error or None).
 
-    Windows and Linux return the list from the OS's most recent background scan
-    (refreshed every so often by the OS), so this is cheap and does not
-    interrupt your connection.
+    Call request_rescan() first for a fresh list. Without it, Windows and Linux
+    return whatever their last background scan found, which can be minutes old.
     """
     system = platform.system()
     try:
@@ -345,16 +414,45 @@ def scan_aps():
         return [], type(e).__name__
 
 
-def summarize_scan(aps, connected_bssid, connected_channel):
-    """Mark which AP you are on, and count others on the same channel."""
+def band_of(band, channel):
+    """Normalize a band label, guessing from the channel number if it is missing."""
+    if band:
+        b = str(band).replace(" ", "").lower()
+        return "2.4" if b.startswith("2.4") else "5" if b.startswith("5") else "6" if b.startswith("6") else None
+    ch = channel_number(channel)
+    if ch is None:
+        return None
+    return "2.4" if int(ch) <= 14 else "5"
+
+
+def summarize_scan(aps, connected_bssid, connected_channel, connected_band=None):
+    """Mark which AP you are on, and count other APs that interfere with yours.
+
+    Returns (ap_count, same_channel_count, overlap_channel_count).
+    - same channel: other APs on exactly your channel and band
+    - overlapping channel: on 2.4 GHz, channels are 5 MHz apart but about 20 MHz
+      wide, so channels within 4 numbers of yours partly overlap it. Those count
+      here (same channel excluded). On 5/6 GHz, 20 MHz channels do not overlap,
+      so this is 0.
+    """
     my_bssid = (connected_bssid or "").lower()
     my_ch = channel_number(connected_channel)
-    same = 0
+    my_band = band_of(connected_band, connected_channel)
+    same = overlap = 0
     for ap in aps:
         ap["is_connected"] = int(bool(my_bssid) and (ap.get("bssid") or "").lower() == my_bssid)
-        if my_ch and not ap["is_connected"] and channel_number(ap.get("channel")) == my_ch:
+        if not my_ch or ap["is_connected"]:
+            continue
+        ch = channel_number(ap.get("channel"))
+        if ch is None or band_of(ap.get("band"), ap.get("channel")) != my_band:
+            continue
+        if ch == my_ch:
             same += 1
-    return len(aps), (same if my_ch else None)
+        elif my_band == "2.4" and abs(int(ch) - int(my_ch)) <= 4:
+            overlap += 1
+    if not my_ch:
+        return len(aps), None, None
+    return len(aps), same, overlap
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +509,7 @@ def timed_upload(url=UPLOAD_URL, size=UPLOAD_BYTES, timeout=TRANSFER_TIMEOUT_S):
 # ---------------------------------------------------------------------------
 class Collector:
     def __init__(self, db_path, location, device_id, reading_interval,
-                 transfer_interval, scan_interval, pings_per_reading):
+                 transfer_interval, scan_interval, pings_per_reading, rescan=True):
         self.db_path = db_path
         self.location = location
         self.device_id = device_id
@@ -421,6 +519,7 @@ class Collector:
         self.transfer_interval = transfer_interval
         self.scan_interval = scan_interval
         self.pings_per_reading = pings_per_reading
+        self.rescan = rescan
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.db = sqlite3.connect(db_path, check_same_thread=False)
@@ -491,20 +590,24 @@ class Collector:
             self.db.commit()
 
     def take_scan(self):
+        rescanned = request_rescan() if self.rescan else False
         ts = now_iso()
         sig = read_signal()
         aps, err = scan_aps()
-        count, same = summarize_scan(aps, sig.get("bssid"), sig.get("channel"))
+        count, same, overlap = summarize_scan(aps, sig.get("bssid"), sig.get("channel"),
+                                              sig.get("band"))
         scan_id = str(uuid.uuid4())
         if err:
             self.last_scan = f"APs FAILED ({err})"
         else:
-            self.last_scan = f"APs {count}" + (f" (same ch {same})" if same is not None else "")
+            self.last_scan = f"APs {count}" + (f" (same ch {same}, overlap {overlap})"
+                                               if same is not None else "")
         with self.lock:
             self._insert("scans", {
                 "id": scan_id, "ts": ts, **self._common(),
                 "connected_bssid": sig.get("bssid"), "connected_channel": sig.get("channel"),
                 "ap_count": count if not err else None, "same_channel_count": same,
+                "overlap_channel_count": overlap, "rescanned": int(rescanned),
                 "error": err})
             for ap in aps:
                 self._insert("scan_aps", {
@@ -555,9 +658,11 @@ def main():
     p.add_argument("--scan-interval", type=float, default=60.0,
                    help="seconds between nearby access point scans")
     p.add_argument("--pings", type=int, default=5, help="TCP pings per reading")
+    p.add_argument("--no-rescan", action="store_true",
+                   help="do not force a fresh Wi-Fi scan before each access point scan")
     a = p.parse_args()
     Collector(a.db, a.location.strip().lower(), a.device, a.reading_interval,
-              a.transfer_interval, a.scan_interval, a.pings).run()
+              a.transfer_interval, a.scan_interval, a.pings, rescan=not a.no_rescan).run()
 
 
 if __name__ == "__main__":
