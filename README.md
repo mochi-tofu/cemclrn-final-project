@@ -23,7 +23,7 @@ test traffic it measures with.
    ```
 3. Start it:
    ```
-   python collector.py --location library-4f --device laptop-name --db wifi_data.db
+   python collector.py --location "building-#f-room" --device "laptop-name" --db wifi_data.db
    ```
 4. Leave the window open. Every 5 seconds it prints one line, for example:
    ```
@@ -35,6 +35,7 @@ test traffic it measures with.
 ## Location Naming Scheme
 building-#f-room <br>
 ex: goks-3f-302
+buildings: goks, andrew, lib, ls, yuch
 
 ## Options
 
