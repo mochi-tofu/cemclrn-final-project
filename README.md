@@ -32,6 +32,10 @@ test traffic it measures with.
    The first lines show `n/a` until the first download and scan finish. That is normal.
 5. Stop it with **Ctrl+C**. Wait for `Saved.`
 
+## Location Naming Scheme
+building-#f-room
+ex: goks-3f-302
+
 ## Options
 
 | Option | Required | Default | Meaning |
