@@ -25,6 +25,8 @@ test traffic it measures with.
    ```
    python collector.py --location "building-#f-room" --device "laptop-name" --db wifi_data.db
    ```
+   - location ex: goks-3f-302
+   - buildings: goks, andrew, lib, ls, yuch
 4. Leave the window open. Every 5 seconds it prints one line, for example:
    ```
    [14:03:22] library-4f | signal 87% | latency 12 ms | loss 0% | down 0.85s (ttfb 0.10s) up 1.20s | APs 14 (same ch 3, overlap 5)
@@ -32,10 +34,6 @@ test traffic it measures with.
    The first lines show `n/a` until the first download and scan finish. That is normal.
 5. Stop it with **Ctrl+C**. Wait for `Saved.`
 
-## Location Naming Scheme
-building-#f-room <br>
-ex: goks-3f-302
-buildings: goks, andrew, lib, ls, yuch
 
 ## Options
 
